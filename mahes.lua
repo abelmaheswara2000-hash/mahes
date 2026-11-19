@@ -65,7 +65,20 @@ local config = {
     instantCatch = false,       -- Skip minigame bar
     reelMultiplier = 1.0,       -- Pengali kecepatan reeling
     autoSell = true,            -- Otomatis menjual ikan
-    sellCategory = "Sell All",  -- Kategori penjualan ikan
+    sellMode = "Filter Rarity", -- Mode jual: "Filter Rarity" / "Filter Berat (Max Kg)" / "Bawaan Server (Native)"
+    sellCommon = true,          -- Jual ikan Common (Lemadang, Sendarat, Tuna, Salmon)
+    sellRare = true,            -- Jual ikan Rare (Angler, Marlin, Hiu, Lele)
+    sellEpic = false,           -- Jual ikan Epic (Kraken, Kuda, Lumba Pink) [Default: Disimpan!]
+    sellLegendary = false,      -- Jual ikan Legendary (Orca, Paus, Dugong) [Default: Disimpan!]
+    sellMaxWeight = 100,        -- Berat max (Kg) jika mode Filter Berat
+    keepFishList = {            -- Daftar ikan yang selalu di-protect / disimpan
+        ["ikan kraken"] = true,
+        ["ikan orca"] = true,
+        ["ikan paus"] = true,
+        ["ikan dugong"] = true,
+        ["ikan lumba pink"] = true,
+    },
+    sellCategory = "Sell All",  -- Kategori penjualan ikan bawaan server
     autoBuyRod = true,          -- Otomatis membeli rod saat uang cukup
     autoEquipBestRod = true,    -- Otomatis memakai pancingan terbaik dari inventory
     targetRod = "Next Tier (Urut)", -- Pilihan target beli rod
@@ -252,33 +265,215 @@ local function checkAutoBuyRod(manualNotify)
 end
 
 -- ==================== 3. FITUR AUTO SELL ====================
-local function doSellFish(silent)
-    if not sellRemote then return end
-    local success, totalCash, bonus, totalCount = pcall(function()
-        return sellRemote:InvokeServer("CheckFish", config.sellCategory or "Sell All")
-    end)
+local fishRarityDB = {
+    ["ikan lemadang"] = "Common",
+    ["ikan sendarat"] = "Common",
+    ["ikan tuna"] = "Common",
+    ["ikan salmon"] = "Common",
+    ["ikan angler"] = "Rare",
+    ["ikan marlin"] = "Rare",
+    ["ikan hiu"] = "Rare",
+    ["ikan lele"] = "Rare",
+    ["ikan kuda"] = "Epic",
+    ["ikan kraken"] = "Epic",
+    ["ikan lumba pink"] = "Epic",
+    ["ikan orca"] = "Legendary",
+    ["ikan paus"] = "Legendary",
+    ["ikan dugong"] = "Legendary"
+}
+
+local function parseFishTool(tool)
+    if not (tool and tool:IsA("Tool")) then return nil end
+    local name = tool.Name:lower()
+    if not name:find("ikan") then return nil end
     
-    if success and totalCount and tonumber(totalCount) and tonumber(totalCount) > 0 then
-        local sellOk, result = pcall(function()
-            return sellRemote:InvokeServer("SellFish", config.sellCategory or "Sell All")
-        end)
-        if sellOk and result == "Success" then
-            if not silent then
-                Library:MakeNotify({
-                    Title = "Auto Sell",
-                    Description = string.format("Berhasil menjual %s ikan (+Rp %s)!", tostring(totalCount), tostring(totalCash)),
-                    Delay = 2.5
-                })
+    local baseName = name:match("^(ikan%s+[%a%s]+)%s*%(") or name:match("^(ikan%s+[%a%s]+)")
+    if baseName then
+        baseName = baseName:gsub("%s+$", "")
+    else
+        baseName = name
+    end
+    
+    local weight = tonumber(name:match("%(([%d%.]+)%s*[Kk][Gg]%)")) or 0
+    local rarity = fishRarityDB[baseName] or "Common"
+    
+    return {
+        tool = tool,
+        rawName = tool.Name,
+        baseName = baseName,
+        weight = weight,
+        rarity = rarity
+    }
+end
+
+local function getAllFishTools()
+    local char = LocalPlayer.Character
+    local backpack = LocalPlayer.Backpack
+    local fishList = {}
+    
+    if backpack then
+        for _, item in ipairs(backpack:GetChildren()) do
+            local parsed = parseFishTool(item)
+            if parsed then
+                table.insert(fishList, parsed)
             end
-            -- Setelah ikan terjual dan uang bertambah, periksa apakah cukup untuk beli rod baru
-            if config.autoBuyRod then
-                task.delay(0.5, function()
-                    checkAutoBuyRod(false)
-                end)
-            end
-            return true, totalCount, totalCash
         end
     end
+    if char then
+        for _, item in ipairs(char:GetChildren()) do
+            local parsed = parseFishTool(item)
+            if parsed then
+                table.insert(fishList, parsed)
+            end
+        end
+    end
+    return fishList
+end
+
+local function shouldSellFish(fishInfo)
+    if not fishInfo then return false end
+    
+    -- Proteksi ikan wajib simpan (Keep / Whitelist)
+    if config.keepFishList and config.keepFishList[fishInfo.baseName] then
+        return false
+    end
+    
+    if config.sellMode == "Filter Rarity" then
+        if fishInfo.rarity == "Common" then return config.sellCommon end
+        if fishInfo.rarity == "Rare" then return config.sellRare end
+        if fishInfo.rarity == "Epic" then return config.sellEpic end
+        if fishInfo.rarity == "Legendary" then return config.sellLegendary end
+        return false
+    elseif config.sellMode == "Filter Berat (Max Kg)" then
+        if config.sellMaxWeight and fishInfo.weight > config.sellMaxWeight then
+            return false
+        end
+        -- Jangan jual Epic / Legendary di filter berat kecuali diizinkan
+        if (fishInfo.rarity == "Epic" and not config.sellEpic) or (fishInfo.rarity == "Legendary" and not config.sellLegendary) then
+            return false
+        end
+        return true
+    end
+    
+    return true
+end
+
+local function doSellFish(silent)
+    if not sellRemote then return false end
+    
+    -- Mode 1: Bawaan Server (Native)
+    if config.sellMode == "Bawaan Server (Native)" then
+        local success, totalCash, bonus, totalCount = pcall(function()
+            return sellRemote:InvokeServer("CheckFish", config.sellCategory or "Sell All")
+        end)
+        
+        if success and totalCount and tonumber(totalCount) and tonumber(totalCount) > 0 then
+            local sellOk, result = pcall(function()
+                return sellRemote:InvokeServer("SellFish", config.sellCategory or "Sell All")
+            end)
+            if sellOk and result == "Success" then
+                if not silent then
+                    Library:MakeNotify({
+                        Title = "Auto Sell (Native)",
+                        Description = string.format("Berhasil menjual %s ikan (+Rp %s)!", tostring(totalCount), tostring(totalCash)),
+                        Delay = 2.5
+                    })
+                end
+                if config.autoBuyRod then
+                    task.delay(0.5, function()
+                        checkAutoBuyRod(false)
+                    end)
+                end
+                return true, totalCount, totalCash
+            end
+        end
+        return false
+    end
+    
+    -- Mode 2: Selektif / Terfilter (Filter Rarity & Berat)
+    local allFish = getAllFishTools()
+    if #allFish == 0 then return false end
+    
+    local toSell = {}
+    local keptCount = 0
+    for _, f in ipairs(allFish) do
+        if shouldSellFish(f) then
+            table.insert(toSell, f)
+        else
+            keptCount = keptCount + 1
+        end
+    end
+    
+    if #toSell == 0 then
+        if not silent then
+            Library:MakeNotify({
+                Title = "Auto Sell",
+                Description = string.format("Semua ikan (%s ekor) aman tersimpan sesuai filter!", tostring(keptCount)),
+                Delay = 2.5
+            })
+        end
+        return false
+    end
+    
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not (char and hum and hum.Health > 0) then return false end
+    
+    local soldCount = 0
+    local totalEarned = 0
+    
+    for _, f in ipairs(toSell) do
+        if f.tool and f.tool.Parent then
+            hum:EquipTool(f.tool)
+            task.wait(0.12)
+            
+            local priceStr = "0"
+            pcall(function()
+                local v1 = sellRemote:InvokeServer("CheckFish", "Sell this fish")
+                if v1 then priceStr = tostring(v1) end
+            end)
+            
+            local sellOk, res = pcall(function()
+                return sellRemote:InvokeServer("SellFish", "Sell this fish")
+            end)
+            
+            if sellOk and (res == "Success" or res == true) then
+                soldCount = soldCount + 1
+                local cleanPrice = priceStr:gsub("%.", "")
+                totalEarned = totalEarned + (tonumber(cleanPrice) or 0)
+            end
+            task.wait(0.08)
+        end
+    end
+    
+    -- Pasang kembali Rod terbaik setelah selesai menjual ikan
+    task.delay(0.2, function()
+        if config.autoEquipBestRod then
+            equipBestRod(false)
+        else
+            local rod = findBestRod()
+            if rod and char and hum and hum.Health > 0 then
+                hum:EquipTool(rod)
+            end
+        end
+    end)
+    
+    if soldCount > 0 then
+        if not silent then
+            Library:MakeNotify({
+                Title = "Auto Sell (Terfilter)",
+                Description = string.format("Terjual: %s ikan (+Rp %s) | Disimpan: %s ikan langka", tostring(soldCount), tostring(totalEarned), tostring(keptCount)),
+                Delay = 3.5
+            })
+        end
+        if config.autoBuyRod then
+            task.delay(0.5, function()
+                checkAutoBuyRod(false)
+            end)
+        end
+        return true, soldCount, totalEarned
+    end
+    
     return false
 end
 
@@ -943,14 +1138,67 @@ ShopSection:AddToggle({
         config.autoSell = state
         Library:MakeNotify({
             Title = "Auto Sell",
-            Description = state and "Auto Sell AKTIF! Ikan akan langsung dijual setelah didapat." or "Auto Sell dinonaktifkan.",
+            Description = state and "Auto Sell AKTIF! Ikan akan disortir & dijual sesuai filter." or "Auto Sell dinonaktifkan.",
             Delay = 2.5
         })
     end
 })
 
 ShopSection:AddDropdown({
-    Title = "Kategori Auto Sell",
+    Title = "Mode Auto Sell",
+    Multi = false,
+    Options = {"Filter Rarity", "Filter Berat (Max Kg)", "Bawaan Server (Native)"},
+    Default = "Filter Rarity",
+    Callback = function(val)
+        config.sellMode = val or "Filter Rarity"
+    end
+})
+
+ShopSection:AddToggle({
+    Title = "Jual Ikan Common (Lemadang/Sendarat/Tuna/Salmon)",
+    Default = true,
+    Callback = function(state)
+        config.sellCommon = state
+    end
+})
+
+ShopSection:AddToggle({
+    Title = "Jual Ikan Rare (Hiu/Marlin/Angler/Lele)",
+    Default = true,
+    Callback = function(state)
+        config.sellRare = state
+    end
+})
+
+ShopSection:AddToggle({
+    Title = "Jual Ikan Epic (Kraken/Lumba Pink/Kuda)",
+    Default = false,
+    Callback = function(state)
+        config.sellEpic = state
+    end
+})
+
+ShopSection:AddToggle({
+    Title = "Jual Ikan Legendary (Orca/Paus/Dugong)",
+    Default = false,
+    Callback = function(state)
+        config.sellLegendary = state
+    end
+})
+
+ShopSection:AddDropdown({
+    Title = "Batas Berat Max (Hanya Mode Berat)",
+    Multi = false,
+    Options = {"50 Kg", "100 Kg", "200 Kg", "400 Kg", "600 Kg"},
+    Default = "100 Kg",
+    Callback = function(val)
+        local num = tonumber(tostring(val):match("%d+"))
+        config.sellMaxWeight = num or 100
+    end
+})
+
+ShopSection:AddDropdown({
+    Title = "Kategori Server (Hanya Mode Native)",
     Multi = false,
     Options = {"Sell All", "All under 50 Kg", "All under 100 Kg", "All under 400 Kg", "All under 600 Kg"},
     Default = "Sell All",
@@ -966,8 +1214,8 @@ ShopSection:AddButton({
         if not ok then
             Library:MakeNotify({
                 Title = "Auto Sell",
-                Description = "Tidak ada ikan yang bisa dijual saat ini.",
-                Delay = 2
+                Description = "Tidak ada ikan yang memenuhi filter untuk dijual saat ini.",
+                Delay = 2.5
             })
         end
     end
